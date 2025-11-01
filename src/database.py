@@ -41,7 +41,8 @@ class Database:
             test_steps TEXT,
             expected_result TEXT NOT NULL,
             priority TEXT,
-            case_collection_name TEXT
+            case_collection_name TEXT,
+            project_id TEXT
         )
         ''')
         
@@ -76,6 +77,7 @@ class Database:
         self._migrate_old_image_data()
         self._migrate_precondition_to_test_steps()
         self._migrate_add_case_collection_name()
+        self._migrate_add_project_id()
     
     def _migrate_old_image_data(self):
         """迁移旧的图片数据到新表"""
@@ -135,12 +137,27 @@ class Database:
         except sqlite3.Error as e:
             print(f"添加案例集名称列失败: {e}")
     
+    def _migrate_add_project_id(self):
+        """为 test_cases 表增加 project_id 列（如缺失）"""
+        try:
+            self.cursor.execute("PRAGMA table_info(test_cases)")
+            columns = self.cursor.fetchall()
+            has_col = any(col['name'] == 'project_id' for col in columns)
+            if not has_col:
+                self.cursor.execute("ALTER TABLE test_cases ADD COLUMN project_id TEXT")
+                # 为已存在的数据生成project_id
+                self.cursor.execute("UPDATE test_cases SET project_id = SUBSTR(case_id, 1, 12) WHERE project_id IS NULL")
+                self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"添加项目ID列失败: {e}")
+    
     def import_test_cases(self, cases_data, case_collection_name: Optional[str] = None):
         """
         导入测试用例数据
         
         Args:
             cases_data: 包含测试用例数据的列表，每个元素是一个字典
+            case_collection_name: 可选的案例集名称
         
         Returns:
             tuple: (成功导入的数量, 总数量)
@@ -148,31 +165,42 @@ class Database:
         success_count = 0
         total_count = len(cases_data)
         
+        # 首先检查是否有已存在的案例，并获取其案例集名称
+        existing_collection_name = None
         for case in cases_data:
             try:
-                # 读取已存在的案例集名称，避免被空值覆盖
-                existing_name = None
-                try:
-                    self.cursor.execute('SELECT case_collection_name FROM test_cases WHERE case_id = ?', (case.get('用例ID', ''),))
-                    row = self.cursor.fetchone()
-                    if row:
-                        # row 可能是 Row 或 dict
-                        existing_name = row['case_collection_name'] if isinstance(row, sqlite3.Row) or isinstance(row, dict) else row[0]
-                except sqlite3.Error:
-                    existing_name = None
+                case_id = case.get('用例ID', '')
+                self.cursor.execute('SELECT case_collection_name FROM test_cases WHERE case_id = ?', (case_id,))
+                row = self.cursor.fetchone()
+                if row and row['case_collection_name']:
+                    existing_collection_name = row['case_collection_name']
+                    break
+            except sqlite3.Error:
+                continue
 
-                final_collection_name = (case.get('案例集名称') or case_collection_name or existing_name)
+        # 如果没有在参数中指定案例集名称，但找到了已存在案例的集名称，就使用已存在的
+        final_collection_name = case_collection_name or existing_collection_name
+        
+        for case in cases_data:
+            try:
+                # 如果案例中自带案例集名称，优先使用案例中的
+                case_specific_collection = case.get('案例集名称')
+                
+                case_id = case.get('用例ID', '')
+                project_id = case_id[:12] if case_id else ''  # 取案例ID的前12位作为项目ID
+                
                 self.cursor.execute('''
                 INSERT OR REPLACE INTO test_cases 
-                (case_id, scenario, test_steps, expected_result, priority, case_collection_name)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (case_id, scenario, test_steps, expected_result, priority, case_collection_name, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    case.get('用例ID', ''),
+                    case_id,
                     case.get('测试场景', ''),
                     (case.get('测试步骤') or case.get('前置条件') or ''),
                     case.get('预期结果', ''),
                     case.get('优先级', ''),
-                    final_collection_name
+                    case_specific_collection or final_collection_name,
+                    project_id
                 ))
                 success_count += 1
             except sqlite3.Error as e:
@@ -205,7 +233,7 @@ class Database:
     
     def save_test_record(self, case_id, status, actual_result='', notes='', image_paths=None, executor=''):
         """
-        保存测试执行记录
+        保存测试执行记录，如果已存在则更新，否则创建新记录
         
         Args:
             case_id: 测试用例ID
@@ -216,29 +244,40 @@ class Database:
             executor: 执行人
             
         Returns:
-            int: 新记录的ID
+            int: 记录的ID
         """
-        timestamp = int(datetime.now().timestamp())
+        # 检查是否已有记录
+        self.cursor.execute('SELECT record_id FROM test_records WHERE case_id = ? ORDER BY timestamp DESC LIMIT 1', (case_id,))
+        existing_record = self.cursor.fetchone()
         
-        self.cursor.execute('''
-        INSERT INTO test_records 
-        (case_id, status, actual_result, notes, executor, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', (case_id, status, actual_result, notes, executor, timestamp))
-        
-        record_id = self.cursor.lastrowid
-        
-        # 保存图片路径
-        if image_paths:
-            for i, path in enumerate(image_paths):
-                if path:
-                    self.cursor.execute('''
-                    INSERT INTO record_images (record_id, image_path, order_index)
-                    VALUES (?, ?, ?)
-                    ''', (record_id, path, i))
-        
-        self.conn.commit()
-        return record_id
+        if existing_record:
+            # 更新现有记录
+            record_id = existing_record['record_id']
+            self.update_test_record(record_id, status, actual_result, notes, image_paths, executor)
+            return record_id
+        else:
+            # 创建新记录
+            timestamp = int(datetime.now().timestamp())
+            
+            self.cursor.execute('''
+            INSERT INTO test_records 
+            (case_id, status, actual_result, notes, executor, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''', (case_id, status, actual_result, notes, executor, timestamp))
+            
+            record_id = self.cursor.lastrowid
+            
+            # 保存图片路径
+            if image_paths:
+                for i, path in enumerate(image_paths):
+                    if path:
+                        self.cursor.execute('''
+                        INSERT INTO record_images (record_id, image_path, order_index)
+                        VALUES (?, ?, ?)
+                        ''', (record_id, path, i))
+            
+            self.conn.commit()
+            return record_id
     
     def update_test_record(self, record_id, status=None, actual_result=None, notes=None, image_paths=None, executor=None):
         """
@@ -450,6 +489,34 @@ class Database:
         except sqlite3.Error:
             return []
     
+    def get_all_project_ids(self):
+        """获取所有项目ID列表（去重）"""
+        try:
+            self.cursor.execute('''
+                SELECT DISTINCT project_id
+                FROM test_cases
+                WHERE project_id IS NOT NULL AND project_id != ''
+                ORDER BY project_id
+            ''')
+            rows = self.cursor.fetchall()
+            return [row['project_id'] for row in rows]
+        except sqlite3.Error:
+            return []
+    
+    def get_collections_by_project(self, project_id):
+        """获取指定项目ID下的所有案例集名称"""
+        try:
+            self.cursor.execute('''
+                SELECT DISTINCT case_collection_name AS name
+                FROM test_cases
+                WHERE project_id = ? AND case_collection_name IS NOT NULL AND case_collection_name != ''
+                ORDER BY case_collection_name
+            ''', (project_id,))
+            rows = self.cursor.fetchall()
+            return [row['name'] for row in rows]
+        except sqlite3.Error:
+            return []
+    
     def get_latest_records(self):
         """
         获取每个测试用例的最新执行记录
@@ -476,7 +543,67 @@ class Database:
         
         return result
     
-    def export_test_records(self, start_date=None, end_date=None, case_id=None, status=None, collection_name=None, search_text=None):
+    def get_cases_by_collection(self, collection_name):
+        """获取指定案例集的所有测试用例"""
+        self.cursor.execute('SELECT * FROM test_cases WHERE case_collection_name = ?', (collection_name,))
+        rows = self.cursor.fetchall()
+        normalized = []
+        for row in rows:
+            row_dict = dict(row)
+            # 兼容：优先使用 test_steps，其次使用 precondition
+            row_dict['test_steps'] = row_dict.get('test_steps') or row_dict.get('precondition') or None
+            normalized.append(row_dict)
+        return normalized
+    
+    def delete_test_case(self, case_id):
+        """
+        删除测试用例及其所有相关记录
+        
+        Args:
+            case_id: 要删除的测试用例ID
+        """
+        try:
+            # 获取所有相关的测试记录ID
+            self.cursor.execute('SELECT record_id FROM test_records WHERE case_id = ?', (case_id,))
+            record_ids = [row['record_id'] for row in self.cursor.fetchall()]
+            
+            # 删除所有相关的图片记录
+            for record_id in record_ids:
+                self.cursor.execute('DELETE FROM record_images WHERE record_id = ?', (record_id,))
+            
+            # 删除所有相关的测试记录
+            self.cursor.execute('DELETE FROM test_records WHERE case_id = ?', (case_id,))
+            
+            # 删除测试用例
+            self.cursor.execute('DELETE FROM test_cases WHERE case_id = ?', (case_id,))
+            
+            self.conn.commit()
+            
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            raise Exception(f"删除测试用例失败: {str(e)}")
+    
+    def delete_collection(self, collection_name):
+        """
+        删除整个测试集及其所有相关记录
+        
+        Args:
+            collection_name: 要删除的案例集名称
+        """
+        try:
+            # 获取该案例集中的所有用例ID
+            self.cursor.execute('SELECT case_id FROM test_cases WHERE case_collection_name = ?', (collection_name,))
+            case_ids = [row['case_id'] for row in self.cursor.fetchall()]
+            
+            # 删除每个用例及其相关记录
+            for case_id in case_ids:
+                self.delete_test_case(case_id)
+            
+        except sqlite3.Error as e:
+            self.conn.rollback()
+            raise Exception(f"删除测试集失败: {str(e)}")
+    
+    def export_test_records(self, start_date=None, end_date=None, case_id=None, status=None, project_id=None, collection_name=None, search_text=None):
         """
         导出测试记录数据
         
@@ -485,6 +612,7 @@ class Database:
             end_date: 可选，结束日期（时间戳）
             case_id: 可选，按用例ID筛选
             status: 可选，按状态筛选
+            project_id: 可选，按项目ID筛选
             collection_name: 可选，按案例集名称筛选
             search_text: 可选，和历史界面一致的搜索逻辑（中文匹配场景，否则匹配用例ID）
             
@@ -500,6 +628,11 @@ class Database:
             case = self.get_test_case(record['case_id'])
             if not case:
                 continue
+
+            # 按项目ID筛选
+            if project_id:
+                if not record['case_id'].startswith(project_id):
+                    continue
 
             # 按案例集筛选
             if collection_name:
